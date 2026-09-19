@@ -89,6 +89,16 @@ class ConflictError extends Error {
 
 const environment = 'production'
 const globalFlag = '--global'
+const originalSetTimeout = globalThis.setTimeout
+
+function immediateTimeout<TArgs extends unknown[]>(
+  callback: (...args: TArgs) => void,
+  _delay = 0,
+  ...args: TArgs
+): NodeJS.Timeout {
+  callback(...args)
+  return originalSetTimeout(() => undefined, 0)
+}
 
 const lockBase64Monalisa =
   'ewogICAgInJlYXNvbiI6IG51bGwsCiAgICAiYnJhbmNoIjogImNvb2wtbmV3LWZlYXR1cmUiLAogICAgImNyZWF0ZWRfYXQiOiAiMjAyMi0wNi0xNVQyMToxMjoxNC4wNDFaIiwKICAgICJjcmVhdGVkX2J5IjogIm1vbmFsaXNhIiwKICAgICJzdGlja3kiOiBmYWxzZSwKICAgICJlbnZpcm9ubWVudCI6ICJwcm9kdWN0aW9uIiwKICAgICJ1bmxvY2tfY29tbWFuZCI6ICIudW5sb2NrIHByb2R1Y3Rpb24iLAogICAgImdsb2JhbCI6IGZhbHNlLAogICAgImxpbmsiOiAiaHR0cHM6Ly9naXRodWIuY29tL3Rlc3Qtb3JnL3Rlc3QtcmVwby9wdWxsLzMjaXNzdWVjb21tZW50LTEyMyIKfQo='
@@ -129,6 +139,9 @@ function encodeLockValue(value: unknown): string {
 }
 
 interface LockOctokitOverrides {
+  readonly acquisitionGit?: Partial<
+    Pick<LockOctokit['rest']['git'], 'createRef' | 'deleteRef' | 'getRef'>
+  >
   readonly git?: Partial<LockOctokit['rest']['git']>
   readonly globalBranchExists?: boolean
   readonly issues?: Partial<LockOctokit['rest']['issues']>
@@ -176,12 +189,48 @@ function mockGetContent(
 function createLockOctokit(overrides: LockOctokitOverrides = {}): LockOctokit {
   const {getBranch: getBranchOverride, ...reposOverrides} =
     overrides.repos ?? {}
+  const {
+    createRef: createRefOverride,
+    deleteRef: deleteRefOverride,
+    getRef: getRefOverride,
+    ...gitOverrides
+  } = overrides.git ?? {}
   const targetGetBranch =
     getBranchOverride ??
     createMock<LockOctokit['rest']['repos']['getBranch']>(() =>
       Promise.resolve({
         data: {
           commit: {sha: 'abc123', commit: {tree: {sha: 'base-tree-sha'}}}
+        }
+      })
+    )
+  const targetCreateRef =
+    createRefOverride ??
+    createMock<LockOctokit['rest']['git']['createRef']>(() =>
+      Promise.resolve(undefined)
+    )
+  const acquisitionCreateRef =
+    overrides.acquisitionGit?.createRef ??
+    createMock<LockOctokit['rest']['git']['createRef']>(() =>
+      Promise.resolve(undefined)
+    )
+  const acquisitionDeleteRef =
+    overrides.acquisitionGit?.deleteRef ??
+    deleteRefOverride ??
+    createMock<LockOctokit['rest']['git']['deleteRef']>(() =>
+      Promise.resolve(undefined)
+    )
+  const acquisitionGetRef =
+    overrides.acquisitionGit?.getRef ??
+    getRefOverride ??
+    createMock<LockOctokit['rest']['git']['getRef']>(() =>
+      Promise.resolve({
+        data: {
+          object: {
+            sha: 'base-commit-sha',
+            type: 'commit',
+            url: 'https://api.github.example/repos/corp/test/git/commits/base-commit-sha'
+          }
         }
       })
     )
@@ -195,13 +244,16 @@ function createLockOctokit(overrides: LockOctokitOverrides = {}): LockOctokit {
         createCommit: createMock<LockOctokit['rest']['git']['createCommit']>(
           () => Promise.resolve({data: {sha: 'commit-sha'}})
         ),
-        createRef: createMock<LockOctokit['rest']['git']['createRef']>(() =>
-          Promise.resolve(undefined)
-        ),
+        createRef: parameters =>
+          parameters?.ref === 'refs/heads/branch-deploy-lock-acquisition'
+            ? acquisitionCreateRef(parameters)
+            : targetCreateRef(parameters),
+        deleteRef: acquisitionDeleteRef,
+        getRef: acquisitionGetRef,
         createTree: createMock<LockOctokit['rest']['git']['createTree']>(() =>
           Promise.resolve({data: {sha: 'tree-sha'}})
         ),
-        ...overrides.git
+        ...gitOverrides
       },
       issues: {
         createComment: createMock<
@@ -714,6 +766,216 @@ test('allows one concurrent acquisition and classifies the losing contender', as
   })
   assertCalledTimes(createRef, 2)
   assertSetFailedMatches(/currently claimed by __monalisa__/u)
+})
+
+test('serializes global and environment lock publication in both orders', async testContext => {
+  testContext.mock.method(globalThis, 'setTimeout', immediateTimeout)
+  const refs = new Map<string, string>()
+  const blobs = new Map<string, string>()
+  const trees = new Map<string, string>()
+  const commits = new Map<string, string>()
+  let nextObject = 0
+  const publicationGate = (branch: string) => {
+    let resume: (() => void) | undefined
+    let notify: (() => void) | undefined
+    return {
+      branch,
+      paused: new Promise<void>(resolve => {
+        resume = resolve
+      }),
+      reached: new Promise<void>(resolve => {
+        notify = resolve
+      }),
+      notify: (): void => notify?.(),
+      resume: (): void => resume?.()
+    }
+  }
+  let gate = publicationGate('global-branch-deploy-lock')
+
+  const createBlob = createMock<LockOctokit['rest']['git']['createBlob']>(
+    parameters => {
+      const sha = `blob-${String(++nextObject)}`
+      blobs.set(sha, parameters?.content ?? '')
+      return Promise.resolve({data: {sha}})
+    }
+  )
+  const createTree = createMock<LockOctokit['rest']['git']['createTree']>(
+    parameters => {
+      const sha = `tree-${String(++nextObject)}`
+      const blobSha = parameters?.tree?.[0]?.sha
+      if (typeof blobSha === 'string') trees.set(sha, blobSha)
+      return Promise.resolve({data: {sha}})
+    }
+  )
+  const createCommit = createMock<LockOctokit['rest']['git']['createCommit']>(
+    parameters => {
+      const sha = `commit-${String(++nextObject)}`
+      const blobSha = trees.get(parameters?.tree ?? '')
+      const contents = blobSha === undefined ? undefined : blobs.get(blobSha)
+      if (contents !== undefined) commits.set(sha, contents)
+      return Promise.resolve({data: {sha}})
+    }
+  )
+  const createRef = createMock<LockOctokit['rest']['git']['createRef']>(
+    async parameters => {
+      const branch = parameters?.ref?.replace('refs/heads/', '') ?? ''
+      if (refs.has(branch)) throw new ConflictError(422)
+      if (branch === gate.branch) {
+        gate.notify()
+        await gate.paused
+      }
+      refs.set(branch, parameters?.sha ?? '')
+      return {status: 201}
+    }
+  )
+  const deleteRef = createMock<LockOctokit['rest']['git']['deleteRef']>(
+    parameters => {
+      refs.delete(parameters?.ref?.replace('heads/', '') ?? '')
+      return Promise.resolve({status: 204})
+    }
+  )
+  const octokit = createLockOctokit({
+    acquisitionGit: {createRef, deleteRef},
+    git: {createBlob, createCommit, createRef, createTree},
+    repos: {
+      getBranch: createMock<LockOctokit['rest']['repos']['getBranch']>(
+        parameters => {
+          const branch = parameters?.branch ?? ''
+          if (branch === 'main') {
+            return Promise.resolve({
+              data: {
+                commit: {
+                  sha: 'base-commit-sha',
+                  commit: {tree: {sha: 'base-tree-sha'}}
+                }
+              }
+            })
+          }
+          const sha = refs.get(branch)
+          return sha === undefined
+            ? Promise.reject(new NotFoundError('Reference does not exist'))
+            : Promise.resolve({data: {commit: {sha}}})
+        }
+      ),
+      getContent: createMock<LockOctokit['rest']['repos']['getContent']>(
+        parameters => {
+          const sha = refs.get(parameters?.ref ?? '')
+          const contents = sha === undefined ? undefined : commits.get(sha)
+          return contents === undefined
+            ? Promise.reject(new NotFoundError('file not found'))
+            : Promise.resolve({
+                data: {content: Buffer.from(contents).toString('base64')}
+              })
+        }
+      )
+    }
+  })
+  const globalContext = contextFor('.lock --global', 'octocat', 456)
+  const globalRequest = lock(
+    lockRequest({
+      context: globalContext,
+      environment: null,
+      octokit,
+      sticky: true
+    })
+  )
+  await gate.reached
+  const environmentRequest = lock(lockRequest({octokit}))
+  await Promise.resolve()
+  gate.resume()
+
+  const [globalResult, environmentResult] = await Promise.allSettled([
+    globalRequest,
+    environmentRequest
+  ])
+  assert.strictEqual(globalResult.status, 'fulfilled')
+  if (globalResult.status === 'fulfilled') {
+    assert.strictEqual(globalResult.value.status, true)
+  }
+  assert.strictEqual(environmentResult.status, 'fulfilled')
+  if (environmentResult.status === 'fulfilled') {
+    assert.strictEqual(environmentResult.value.status, false)
+  }
+  assert.ok(refs.has('global-branch-deploy-lock'))
+  assert.ok(!refs.has('production-branch-deploy-lock'))
+
+  refs.delete('global-branch-deploy-lock')
+  gate = publicationGate('production-branch-deploy-lock')
+  const environmentFirst = lock(lockRequest({octokit}))
+  await gate.reached
+  const globalSecond = lock(
+    lockRequest({
+      context: globalContext,
+      environment: null,
+      octokit,
+      sticky: true
+    })
+  )
+  await Promise.resolve()
+  gate.resume()
+
+  const [environmentFirstResult, globalSecondResult] = await Promise.all([
+    environmentFirst,
+    globalSecond
+  ])
+  assert.strictEqual(environmentFirstResult.status, true)
+  assert.strictEqual(globalSecondResult.status, true)
+  assert.ok(refs.has('production-branch-deploy-lock'))
+  assert.ok(refs.has('global-branch-deploy-lock'))
+})
+
+for (const status of [409, 422] as const) {
+  test(`rejects lock acquisition while the serializer ref returns ${status}`, async testContext => {
+    testContext.mock.method(globalThis, 'setTimeout', immediateTimeout)
+    const targetCreateRef = createMock<LockOctokit['rest']['git']['createRef']>(
+      () => Promise.resolve({status: 201})
+    )
+    const deleteRef = createMock<LockOctokit['rest']['git']['deleteRef']>(() =>
+      Promise.resolve({status: 204})
+    )
+    const octokit = createLockOctokit({
+      acquisitionGit: {
+        createRef: createMock<LockOctokit['rest']['git']['createRef']>(() =>
+          Promise.reject(new ConflictError(status))
+        ),
+        deleteRef
+      },
+      git: {createRef: targetCreateRef}
+    })
+
+    await assert.rejects(
+      lock(lockRequest({octokit})),
+      /deployment lock acquisition is already in progress/u
+    )
+    assertNotCalled(targetCreateRef)
+    assertNotCalled(deleteRef)
+  })
+}
+
+test('rethrows an unexpected serializer ref failure', async () => {
+  const error = new BigBadError('serializer unavailable')
+  const targetCreateRef = createMock<LockOctokit['rest']['git']['createRef']>(
+    () => Promise.resolve({status: 201})
+  )
+  const deleteRef = createMock<LockOctokit['rest']['git']['deleteRef']>(() =>
+    Promise.resolve({status: 204})
+  )
+  const octokit = createLockOctokit({
+    acquisitionGit: {
+      createRef: createMock<LockOctokit['rest']['git']['createRef']>(() =>
+        Promise.reject(error)
+      ),
+      deleteRef
+    },
+    git: {createRef: targetCreateRef}
+  })
+
+  await assert.rejects(
+    lock(lockRequest({octokit})),
+    candidate => candidate === error
+  )
+  assertNotCalled(targetCreateRef)
+  assertNotCalled(deleteRef)
 })
 
 for (const status of [409, 422] as const) {

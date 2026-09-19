@@ -1,4 +1,5 @@
 import {Buffer} from 'node:buffer'
+import assert from 'node:assert/strict'
 import {
   createServer,
   type IncomingMessage,
@@ -1033,6 +1034,24 @@ function routeGit(
     state.commitsToTrees.set(commitSha, treeShaValue)
     state.commits.set(commitSha, createCommit(commitSha, true))
     return {status: 201, value: {sha: commitSha}}
+  }
+  if (method === 'GET' && resource === 'ref' && parts.length === 6) {
+    const ref = decodeURIComponent(part(parts, 5)).replace('heads/', '')
+    const branch = state.branches.get(ref)
+    assert.ok(branch !== undefined, `missing mock ref: ${ref}`)
+    return {
+      status: 200,
+      value: {
+        ref: `refs/heads/${ref}`,
+        node_id: `ref-${ref}`,
+        url: `https://api.github.example/repos/${state.owner}/${state.repo}/git/refs/heads/${ref}`,
+        object: {
+          sha: branch.sha,
+          type: 'commit',
+          url: `https://api.github.example/repos/${state.owner}/${state.repo}/git/commits/${branch.sha}`
+        }
+      }
+    }
   }
   if (method === 'POST' && resource === 'refs' && parts.length === 5) {
     const ref = requireString(body, 'ref').replace('refs/heads/', '')

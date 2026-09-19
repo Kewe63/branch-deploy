@@ -27,11 +27,19 @@ import type {
 // Constants for the lock file
 const LOCK_BRANCH_SUFFIX = LOCK_METADATA.lockBranchSuffix
 const GLOBAL_LOCK_BRANCH = LOCK_METADATA.globalLockBranch
+const LOCK_ACQUISITION_BRANCH = 'branch-deploy-lock-acquisition'
+const LOCK_ACQUISITION_ATTEMPTS = 20
+const LOCK_ACQUISITION_RETRY_MS = 250
 const LOCK_FILE = LOCK_METADATA.lockFile
 const LOCK_COMMIT_MSG = LOCK_METADATA.lockCommitMsg
 
 type CreateRefMethod = BranchDeployOctokit['rest']['git']['createRef']
 type CreateRefParameters = Parameters<CreateRefMethod>[0]
+type DeleteRefMethod = BranchDeployOctokit['rest']['git']['deleteRef']
+type DeleteRefParameters = Parameters<DeleteRefMethod>[0]
+type GetRefMethod = BranchDeployOctokit['rest']['git']['getRef']
+type GetRefParameters = Parameters<GetRefMethod>[0]
+type GetRefResponse = Awaited<ReturnType<GetRefMethod>>
 type CreateBlobMethod = BranchDeployOctokit['rest']['git']['createBlob']
 type CreateBlobParameters = Parameters<CreateBlobMethod>[0]
 type CreateCommitMethod = BranchDeployOctokit['rest']['git']['createCommit']
@@ -66,6 +74,10 @@ export interface LockOctokit {
         parameters?: CreateCommitParameters
       ) => Promise<{readonly data: {readonly sha: string}}>
       readonly createRef: (parameters?: CreateRefParameters) => Promise<unknown>
+      readonly deleteRef: (parameters?: DeleteRefParameters) => Promise<unknown>
+      readonly getRef: (parameters?: GetRefParameters) => Promise<{
+        readonly data: Pick<GetRefResponse['data'], 'object'>
+      }>
       readonly createTree: (
         parameters?: CreateTreeParameters
       ) => Promise<{readonly data: {readonly sha: string}}>
@@ -787,7 +799,9 @@ export interface LockRequest {
 // status: true - the lock was claimed
 // status: null - no lock exists
 // status: 'details-only' - the lock details were returned, but the lock was not claimed
-export async function lock(request: LockRequest): Promise<LockResponse> {
+async function lockWithoutSerialization(
+  request: LockRequest
+): Promise<LockResponse> {
   const {context, leaveComment, mode, octokit, reactionId, ref, sticky} =
     request
   let environment = request.environment
@@ -1036,4 +1050,64 @@ export async function lock(request: LockRequest): Promise<LockResponse> {
       sticky
     })
   )
+}
+
+async function acquireLockSerialization(
+  octokit: LockOctokit,
+  context: BranchDeployContext
+): Promise<void> {
+  const repository = await octokit.rest.repos.get({
+    ...context.repo,
+    headers: API_HEADERS
+  })
+  const baseRef = await octokit.rest.git.getRef({
+    ...context.repo,
+    ref: `heads/${repository.data.default_branch}`,
+    headers: API_HEADERS
+  })
+
+  for (let attempt = 0; attempt < LOCK_ACQUISITION_ATTEMPTS; attempt += 1) {
+    try {
+      await octokit.rest.git.createRef({
+        ...context.repo,
+        ref: `refs/heads/${LOCK_ACQUISITION_BRANCH}`,
+        sha: baseRef.data.object.sha,
+        headers: API_HEADERS
+      })
+      return
+    } catch (error) {
+      const status = legacyApiError(error).status
+      if (status !== 409 && status !== 422) throw error
+      if (attempt === LOCK_ACQUISITION_ATTEMPTS - 1) {
+        throw new Error('A deployment lock acquisition is already in progress')
+      }
+      await new Promise<void>(resolve => {
+        setTimeout(resolve, LOCK_ACQUISITION_RETRY_MS)
+      })
+    }
+  }
+}
+
+async function releaseLockSerialization(
+  octokit: LockOctokit,
+  context: BranchDeployContext
+): Promise<void> {
+  await octokit.rest.git.deleteRef({
+    ...context.repo,
+    ref: `heads/${LOCK_ACQUISITION_BRANCH}`,
+    headers: API_HEADERS
+  })
+}
+
+export async function lock(request: LockRequest): Promise<LockResponse> {
+  if (request.mode.type === 'details') {
+    return lockWithoutSerialization(request)
+  }
+
+  await acquireLockSerialization(request.octokit, request.context)
+  try {
+    return await lockWithoutSerialization(request)
+  } finally {
+    await releaseLockSerialization(request.octokit, request.context)
+  }
 }

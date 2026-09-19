@@ -38101,6 +38101,9 @@ function formatLockReason(reason) {
 // Constants for the lock file
 const LOCK_BRANCH_SUFFIX = LOCK_METADATA.lockBranchSuffix;
 const GLOBAL_LOCK_BRANCH = LOCK_METADATA.globalLockBranch;
+const LOCK_ACQUISITION_BRANCH = 'branch-deploy-lock-acquisition';
+const LOCK_ACQUISITION_ATTEMPTS = 20;
+const LOCK_ACQUISITION_RETRY_MS = 250;
 const lock_LOCK_FILE = LOCK_METADATA.lockFile;
 const LOCK_COMMIT_MSG = LOCK_METADATA.lockCommitMsg;
 // Helper function to construct the branch name
@@ -38579,7 +38582,7 @@ async function ambiguousLockResponse({ branchName, context, environment, global,
 // status: true - the lock was claimed
 // status: null - no lock exists
 // status: 'details-only' - the lock details were returned, but the lock was not claimed
-async function lock(request) {
+async function lockWithoutSerialization(request) {
     const { context, leaveComment, mode, octokit, reactionId, ref, sticky } = request;
     let environment = request.environment;
     let global;
@@ -38790,6 +38793,58 @@ async function lock(request) {
         reactionId,
         sticky
     }));
+}
+async function acquireLockSerialization(octokit, context) {
+    const repository = await octokit.rest.repos.get({
+        ...context.repo,
+        headers: API_HEADERS
+    });
+    const baseRef = await octokit.rest.git.getRef({
+        ...context.repo,
+        ref: `heads/${repository.data.default_branch}`,
+        headers: API_HEADERS
+    });
+    for (let attempt = 0; attempt < LOCK_ACQUISITION_ATTEMPTS; attempt += 1) {
+        try {
+            await octokit.rest.git.createRef({
+                ...context.repo,
+                ref: `refs/heads/${LOCK_ACQUISITION_BRANCH}`,
+                sha: baseRef.data.object.sha,
+                headers: API_HEADERS
+            });
+            return;
+        }
+        catch (error) {
+            const status = legacyApiError(error).status;
+            if (status !== 409 && status !== 422)
+                throw error;
+            if (attempt === LOCK_ACQUISITION_ATTEMPTS - 1) {
+                throw new Error('A deployment lock acquisition is already in progress');
+            }
+            await new Promise(resolve => {
+                setTimeout(resolve, LOCK_ACQUISITION_RETRY_MS);
+            });
+        }
+    }
+}
+async function releaseLockSerialization(octokit, context) {
+    await octokit.rest.git.deleteRef({
+        ...context.repo,
+        ref: `heads/${LOCK_ACQUISITION_BRANCH}`,
+        headers: API_HEADERS
+    });
+}
+async function lock(request) {
+    if (request.mode.type === 'details') {
+        return lockWithoutSerialization(request);
+    }
+    await acquireLockSerialization(request.octokit, request.context);
+    try {
+        return await lockWithoutSerialization(request);
+    }
+    finally {
+        await releaseLockSerialization(request.octokit, request.context);
+    }
 }
 
 ;// CONCATENATED MODULE: ./src/functions/valid-permissions.ts

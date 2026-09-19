@@ -76,6 +76,11 @@ function routeBody(
   return requireRecordValue(JSON.parse(route.body), diagnostics(context))
 }
 
+function requestBody(route: MockRouteLog): Record<string, unknown> {
+  const parsed: unknown = JSON.parse(route.body)
+  return requireRecordValue(parsed, route.body)
+}
+
 function routeVariables(
   context: ScenarioContext,
   method: string,
@@ -1199,9 +1204,11 @@ const scenarios = [
             true,
             diagnostics(context, result)
           )
-          assert.equal(
-            context.routeLog.filter(route => route.method === 'DELETE').length,
-            0,
+          assert.deepEqual(
+            context.routeLog
+              .filter(route => route.method === 'DELETE')
+              .map(route => route.path),
+            [apiPath('/git/refs/heads%2Fbranch-deploy-lock-acquisition')],
             diagnostics(context, result)
           )
         }
@@ -1560,9 +1567,12 @@ const scenarios = [
         assert.equal(
           context.routeLog.filter(
             route =>
-              route.method === 'POST' && route.path === apiPath('/git/refs')
+              route.method === 'POST' &&
+              route.path === apiPath('/git/refs') &&
+              requestBody(route)['ref'] ===
+                `refs/heads/${lockBranch('production')}`
           ).length,
-          2,
+          1,
           diagnostics(context, secondResult)
         )
         assert.equal(
